@@ -15,6 +15,11 @@
 
 import pdb
 import time
+from einops.layers.torch import Rearrange
+from einops import rearrange, repeat, pack, unpack
+from transformers import T5Tokenizer, T5EncoderModel
+from torchvision.models.vision_transformer import VisionTransformer, Encoder
+from functools import partial
 
 import argparse
 import contextlib
@@ -30,6 +35,7 @@ from pathlib import Path
 import accelerate
 import numpy as np
 import torch
+from torch import nn
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -66,6 +72,190 @@ check_min_version("0.33.0.dev0")
 
 logger = get_logger(__name__)
 
+def pack_square_height_width(t):
+    assert t.ndim == 4
+    return rearrange(t, 'b h w d -> b (h w) d')
+
+def unpack_square_height_width(t):
+    assert t.ndim == 3
+    hw = int(math.sqrt(t.shape[1]))
+    return rearrange(t, 'b (h w) d -> b h w d', h = hw, w = hw)
+
+class TexTokConfig:
+    batch_size = 2
+    image_size = 256
+    patch_size = 8
+    hidden_size = 768
+    latent_dim = 4
+    num_tokens = 64
+    ViT_number_of_heads = 12
+    ViT_number_of_layers = 12
+    textok_dtype = torch.float32
+
+class TexTok(nn.Module):
+    def __init__(self, config: TexTokConfig, device):
+        super().__init__()
+        self.batch_size = config.batch_size
+        self.image_size = config.image_size
+        self.patch_size = config.patch_size
+
+        self.num_heads = config.ViT_number_of_heads
+        self.depth = config.ViT_number_of_layers
+        
+        assert self.image_size%self.patch_size==0
+
+        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.num_tokens = config.num_tokens
+        self.num_text_tokens = 32
+        self.text_token_dim = 512
+        self.mlp_dim = 3072
+        self.seq_length = self.num_patches + self.num_tokens + self.num_text_tokens  # 1184
+
+        self.device = device
+
+        self.image_to_tokens = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b h w (c p1 p2)', p1=self.patch_size, p2=self.patch_size),
+            nn.Linear(3 * self.patch_size * self.patch_size, config.hidden_size)
+        )
+        # self.patch_embed = nn.Conv2d(in_chans, hidden_size, kernel_size=patch_size, stride=patch_size)
+
+        # Learnable image tokens (N x D)
+        self.image_tokens = nn.Parameter(torch.randn(self.num_tokens, config.hidden_size))
+
+        # Linear projection for text tokens
+        self.text_proj_enc = nn.Linear(self.text_token_dim, config.hidden_size) 
+
+        # Positional embeddings
+        self.pos_emb = nn.Parameter(torch.zeros(self.seq_length, config.hidden_size))
+
+        # Tokenizer (Encoder) ViT
+        # self.vit = VisionTransformer(img_size=image_size, patch_size=patch_size, embed_dim=hidden_size, depth=self.depth, num_heads=self.num_heads, num_classes=0)
+        # vit_model_encoder = timm.create_model(model_name='vit_base_patch16_224', pretrained=False)
+        self.encoder = Encoder(
+            seq_length = self.seq_length,
+            num_layers = self.depth,
+            num_heads = self.num_heads,
+            hidden_dim = config.hidden_size,
+            mlp_dim = self.mlp_dim,
+            dropout = 0.0,
+            attention_dropout = 0.0,
+            norm_layer = partial(nn.LayerNorm, eps=1e-6),
+        )
+        # self.encoder_norm = vit_model_encoder.norm
+        # self.encoder_head = vit_model_encoder.head
+
+        # Linear projection to output image tokens (N x d)
+        self.token_out_proj = nn.Linear(config.hidden_size, config.latent_dim)
+
+        # Detokenizer (Decoder) ViT
+        # self.decoder = VisionTransformer(img_size=image_size, patch_size=patch_size, embed_dim=hidden_size, depth=self.depth, num_heads=self.num_heads, num_classes=0)
+        # vit_model_decoder = timm.create_model(model_name='vit_base_patch16_224', pretrained=False)
+        # self.decoder_transformer = vit_model_decoder.blocks
+        # self.decoder_norm = vit_model_decoder.norm
+        # self.decoder_head = vit_model_decoder.head
+        self.decoder = Encoder(
+            seq_length = self.seq_length,
+            num_layers = self.depth,
+            num_heads = self.num_heads,
+            hidden_dim = config.hidden_size,
+            mlp_dim = self.mlp_dim,
+            dropout = 0.0,
+            attention_dropout = 0.0,
+            norm_layer = partial(nn.LayerNorm, eps=1e-6),
+        )
+        # Learnable patch tokens (hw x D)
+        self.patch_tokens = nn.Parameter(torch.randn(self.num_patches, config.hidden_size))
+        
+        # Linear projections for detokenizer
+        self.image_token_proj = nn.Linear(config.latent_dim, config.hidden_size)
+        self.text_proj_dec = nn.Linear(self.text_token_dim, config.hidden_size)
+        
+        # Reconstruction head
+        # self.reconstruction_head = nn.ConvTranspose2d(hidden_size, in_chans, kernel_size=patch_size, stride=patch_size)
+
+        self.tokens_to_image = nn.Sequential(
+            nn.Linear(config.hidden_size, 3 * self.patch_size * self.patch_size),
+            Rearrange('b h w (c p1 p2) -> b c (h p1) (w p2)', p1=self.patch_size, p2=self.patch_size)
+        )
+
+        nn.init.normal_(self.image_tokens, std = 0.02)
+        nn.init.normal_(self.patch_tokens, std = 0.02)
+        nn.init.normal_(self.pos_emb, std = 0.02)
+
+        
+    def text_embeder(self, text_caption, max_length=32, device = "cpu"):
+        tokenizer = T5Tokenizer.from_pretrained("t5-small")
+        model = T5EncoderModel.from_pretrained("t5-small").to(device)
+
+        # enc = tokenizer(text_caption, return_tensors="pt")
+        enc = tokenizer(text_caption, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(device)
+
+        # forward pass through encoder only
+        with torch.no_grad():
+            encoded = model(**enc).last_hidden_state  # (B, Nt, D)
+
+        return encoded
+
+
+    def encode(self, image, text):
+        # Convert image to patch tokens
+        img_patches = self.image_to_tokens(image)  # B x h x w x D
+        img_patches = pack_square_height_width(img_patches)  # B x hw x D
+
+        # Expand learnable image tokens
+        img_learnable = self.image_tokens.expand(image.size(0), -1, -1)  # B x N x D
+
+        # Embed text and project it
+        text_embd = self.text_embeder(text, max_length=self.num_text_tokens, device=self.device).to(self.device)
+        text_proj_enc = self.text_proj_enc(text_embd)  # B x Nt x D
+
+        # Concatenate image patches, learnable tokens, and text tokens
+        tokenizer_input = torch.cat([img_patches, img_learnable, text_proj_enc], dim=1)  # B x (hw + N + Nt) x D
+
+        # Add positional embeddings
+        pos_emb = repeat(self.pos_emb, 'N D -> B N D', B=tokenizer_input.shape[0])
+        tokenizer_input = tokenizer_input + pos_emb
+
+        # Pass through the encoder
+        tokenizer_output = self.encoder(tokenizer_input)
+
+        # Extract and project image tokens
+        image_tokens = self.token_out_proj(tokenizer_output[:, self.num_patches:self.num_patches + self.num_tokens, :])  # B x N x d
+
+        return image_tokens
+
+    def decode(self, image_tokens, text):
+        # Expand learnable patch tokens
+        patch_tokens = self.patch_tokens.expand(image_tokens.size(0), -1, -1)  # B x hw x D
+
+        # Project image tokens and text tokens
+        print(self.image_token_proj)
+        print(image_tokens.shape)
+        image_token_proj = self.image_token_proj(image_tokens)  # B x N x D
+        text_embd = self.text_embeder(text, max_length=self.num_text_tokens, device=self.device).to(self.device)
+        text_proj_dec = self.text_proj_dec(text_embd)  # B x Nt x D
+
+        # Concatenate patch tokens, projected image tokens, and text tokens
+        detokenizer_input = torch.cat([patch_tokens, image_token_proj, text_proj_dec], dim=1)  # B x (hw + N + Nt) x D
+
+        # Pass through the decoder
+        detokenizer_output = self.decoder(detokenizer_input)
+
+        # Extract patch tokens and reconstruct the image
+        reconstructed_patches = detokenizer_output[:, :self.num_patches, :]  # B x hw x D
+        reconstructed_patches = unpack_square_height_width(reconstructed_patches)  # B x h x w x D
+        reconstructed_img = self.tokens_to_image(reconstructed_patches)  # B x C x H x W
+
+        return reconstructed_img
+
+    def forward(self, input):
+        # Tokenizer: Encode image and text to generate image tokens
+        image_tokens = self.encode(input["image"], input["text"])
+
+        # Detokenizer: Decode image tokens and text to reconstruct the image
+        reconstructed_img = self.decode(image_tokens, input["text"])
+
+        return image_tokens, reconstructed_img
 
 def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_validation=False):
     logger.info("Running validation... ")
@@ -766,11 +956,13 @@ def collate_fn(examples):
 
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
-
+    
+    prompts = [example["prompts"] for example in examples]
     prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
     pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
 
     return {
+        "prompts": prompts,
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_embeds": prompt_embeds,
@@ -898,8 +1090,9 @@ def encode_prompt(
     #prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
     prompt_embeds = torch.cat([clip_prompt_embeds, clip_prompt_embeds], dim=-2)
 
-    return prompt_embeds, pooled_prompt_embeds
+    return prompt, prompt_embeds, pooled_prompt_embeds
 
+'''
 class Adapter(torch.nn.Module):
     def __init__(self):
         super(Adapter, self).__init__()
@@ -907,6 +1100,33 @@ class Adapter(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+'''
+
+class Reshape(nn.Module):
+    def __init__(self, shape):
+        super(Reshape, self).__init__()
+        self.shape = shape
+        
+    def forward(self, x):
+        return x.view(self.shape)
+
+class Adapter(nn.Module):
+    def __init__(self):
+        super(Adapter, self).__init__()
+        
+        # Calculate input and output features
+        input_features = 64 * 4  # 256
+        output_features = 16 * 32 * 32  # 16384
+        
+        # Define the transformation
+        self.transform = nn.Sequential(
+            Reshape((-1, input_features)),  # Reshape to (batch_size, 256)
+            nn.Linear(input_features, output_features),  # Linear layer to transform dimensions
+            Reshape((-1, 16, 32, 32))  # Reshape to target dimensions
+        )
+        
+    def forward(self, x):
+        return self.transform(x)
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -1021,6 +1241,8 @@ def main(args):
     )
    
     adapter = Adapter()
+
+    textok = TexTok(TexTokConfig, accelerator.device).to(accelerator.device)
 
     adapter.requires_grad_(True)
     transformer.requires_grad_(False)
@@ -1157,14 +1379,15 @@ def main(args):
 
     def compute_text_embeddings(batch, text_encoders, tokenizers):
         with torch.no_grad():
+            print(batch)
             prompt = batch["prompts"]
-            prompt_embeds, pooled_prompt_embeds = encode_prompt(
+            prompts, prompt_embeds, pooled_prompt_embeds = encode_prompt(
                 text_encoders, tokenizers, prompt, args.max_sequence_length
             )
             prompt_embeds = prompt_embeds.to(accelerator.device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
         print("RESSSSSSSSSSSSSSSSSSSSSSS", prompt_embeds.shape)
-        res = {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
+        res = {"prompts": prompts, "prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
         #pdb.set_trace()
         return res
 
@@ -1301,13 +1524,19 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
+                
+                print(batch)
+
                 # Convert images to latent space
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                 model_input = vae.encode(pixel_values).latent_dist.sample()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
-                model_input = adapter(model_input)
+                model_input_2 = textok.encode(pixel_values, batch["prompts"][0])
+                print(model_input_2.shape, model_input.shape)
+
+                model_input = adapter(model_input_2)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
