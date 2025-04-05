@@ -950,20 +950,29 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
     return train_dataset
 
 
-def collate_fn(examples):
+def collate_fn(examples, tokenizer):
+    
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
     
+    pixel_values = pixel_values.to("cuda")
+
     prompts = [example["prompts"] for example in examples]
+    
+    print(pixel_values.shape, pixel_values[0].shape)
+
+    tokens = [tokenizer.encode(torch.unsqueeze(pixel_values[i], dim=0), prompts[i][0]) for i in range(len(examples))]
+
     prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
     pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
 
     return {
         "prompts": prompts,
         "pixel_values": pixel_values,
+        "tokens": tokens,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_embeds": prompt_embeds,
         "pooled_prompt_embeds": pooled_prompt_embeds,
@@ -1416,10 +1425,13 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=partial(collate_fn, tokenizer = textok),
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
+
+    del textok
+    free_memory()
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -1528,13 +1540,17 @@ def main(args):
                 print(batch)
 
                 # Convert images to latent space
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
-                model_input = vae.encode(pixel_values).latent_dist.sample()
-                model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
-                model_input = model_input.to(dtype=weight_dtype)
+                #pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+                #model_input = vae.encode(pixel_values).latent_dist.sample()
+                #model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
+                #model_input = model_input.to(dtype=weight_dtype)
 
-                model_input_2 = textok.encode(pixel_values, batch["prompts"][0])
-                print(model_input_2.shape, model_input.shape)
+                #model_input_2 = textok.encode(pixel_values, batch["prompts"][0])
+                #print(model_input_2.shape, model_input.shape)
+
+                model_input_2 = batch["tokens"][0]
+
+                print('model_input_2', model_input_2)
 
                 model_input = adapter(model_input_2)
 
